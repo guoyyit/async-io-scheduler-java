@@ -1,11 +1,12 @@
 package com.github.guoyyit.asyncioschedulerjava;
 
-import org.springframework.boot.SpringApplication;
-import org.springframework.boot.autoconfigure.SpringBootApplication;
+/** Plain entry point placeholder (the scheduler is a library, not a web app). */
+public final class Application {
 
-@SpringBootApplication
-public class Application {
+    private Application() {
+    }
+
     public static void main(String[] args) {
-        SpringApplication.run(Application.class, args);
+        System.out.println("async-io-scheduler-java library");
     }
 }
