@@ -22,12 +22,21 @@ public class PriorityRequestQueue {
     private volatile boolean closed;
 
     private final double[] deficits = new double[IoPriority.values().length];
+    private volatile Runnable agingListener;
 
     public PriorityRequestQueue(int capacity) {
         this.capacity = capacity;
         for (IoPriority priority : IoPriority.values()) {
             queues.put(priority, new ArrayBlockingQueue<>(capacity));
         }
+    }
+
+    /**
+     * Registers a callback fired each time a queued request is promoted by
+     * aging (selected ahead of higher-priority requests).
+     */
+    public void setAgingListener(Runnable listener) {
+        this.agingListener = listener;
     }
 
     public int size() {
@@ -144,6 +153,10 @@ public class PriorityRequestQueue {
         }
         if (candidate == null) {
             return null;
+        }
+        Runnable listener = agingListener;
+        if (listener != null) {
+            listener.run();
         }
         return queues.get(candidate.priority()).poll();
     }

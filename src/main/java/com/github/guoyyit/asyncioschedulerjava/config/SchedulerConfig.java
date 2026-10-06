@@ -34,6 +34,9 @@ public class SchedulerConfig {
     private long defaultReadQuotaBytesPerSec = Long.MAX_VALUE;
     private long defaultWriteQuotaBytesPerSec = Long.MAX_VALUE;
 
+    private CapacityExceededPolicy capacityExceededPolicy = CapacityExceededPolicy.REJECT;
+    private Duration capacityWaitTimeout = Duration.ofSeconds(5);
+
     public int getBlockSize() {
         return blockSize;
     }
@@ -208,5 +211,21 @@ public class SchedulerConfig {
 
     public void setDefaultWriteQuotaBytesPerSec(long defaultWriteQuotaBytesPerSec) {
         this.defaultWriteQuotaBytesPerSec = defaultWriteQuotaBytesPerSec;
+    }
+
+    public CapacityExceededPolicy getCapacityExceededPolicy() {
+        return capacityExceededPolicy;
+    }
+
+    public void setCapacityExceededPolicy(CapacityExceededPolicy capacityExceededPolicy) {
+        this.capacityExceededPolicy = capacityExceededPolicy;
+    }
+
+    public Duration getCapacityWaitTimeout() {
+        return capacityWaitTimeout;
+    }
+
+    public void setCapacityWaitTimeout(Duration capacityWaitTimeout) {
+        this.capacityWaitTimeout = capacityWaitTimeout;
     }
 }

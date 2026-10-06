@@ -5,7 +5,21 @@ package com.github.guoyyit.asyncioschedulerjava.io;
  */
 public class QueueRejectedException extends RuntimeException {
 
+    private final RejectionReason reason;
+
     public QueueRejectedException(String message) {
+        this(message, RejectionReason.UNSPECIFIED);
+    }
+
+    public QueueRejectedException(String message, RejectionReason reason) {
         super(message);
+        this.reason = reason;
+    }
+
+    /**
+     * Machine-readable cause of this rejection (never null).
+     */
+    public RejectionReason reason() {
+        return reason;
     }
 }

@@ -47,7 +47,11 @@ public class SchedulerMetrics {
                 writeBatches, writeBatchBytes, mergedWrites,
                 prefetchesIssued, prefetchBytesIssued,
                 prefetchHits, prefetchHitBytes,
-                prefetchWastedBytes, prefetchBackoffs);
+                prefetchWastedBytes, prefetchBackoffs,
+                prefetchInvalidations, prefetchInvalidatedBytes, prefetchStaleDrops,
+                capacityWaits, capacityWaitNanos,
+                rejectedGlobalCapacity, rejectedSubmitterCapacity, rejectedWaitTimeout,
+                agedRequests);
     }
 
     public void reset() {
@@ -68,6 +72,15 @@ public class SchedulerMetrics {
         prefetchHitBytes = 0;
         prefetchWastedBytes = 0;
         prefetchBackoffs = 0;
+        prefetchInvalidations = 0;
+        prefetchInvalidatedBytes = 0;
+        prefetchStaleDrops = 0;
+        capacityWaits = 0;
+        capacityWaitNanos = 0;
+        rejectedGlobalCapacity = 0;
+        rejectedSubmitterCapacity = 0;
+        rejectedWaitTimeout = 0;
+        agedRequests = 0;
         totalQueueWaitNanos = 0;
         totalServiceNanos = 0;
     }
@@ -94,6 +107,15 @@ public class SchedulerMetrics {
         public final long prefetchHitBytes;
         public final long prefetchWastedBytes;
         public final long prefetchBackoffs;
+        public final long prefetchInvalidations;
+        public final long prefetchInvalidatedBytes;
+        public final long prefetchStaleDrops;
+        public final long capacityWaits;
+        public final long capacityWaitNanos;
+        public final long rejectedGlobalCapacity;
+        public final long rejectedSubmitterCapacity;
+        public final long rejectedWaitTimeout;
+        public final long agedRequests;
 
         public MetricsSnapshot(long submittedReads, long submittedWrites,
                                long completedReads, long completedWrites,
@@ -102,7 +124,12 @@ public class SchedulerMetrics {
                                long writeBatches, long writeBatchBytes, long mergedWrites,
                                long prefetchesIssued, long prefetchBytesIssued,
                                long prefetchHits, long prefetchHitBytes,
-                               long prefetchWastedBytes, long prefetchBackoffs) {
+                               long prefetchWastedBytes, long prefetchBackoffs,
+                               long prefetchInvalidations, long prefetchInvalidatedBytes,
+                               long prefetchStaleDrops,
+                               long capacityWaits, long capacityWaitNanos,
+                               long rejectedGlobalCapacity, long rejectedSubmitterCapacity,
+                               long rejectedWaitTimeout, long agedRequests) {
             this.submittedReads = submittedReads;
             this.submittedWrites = submittedWrites;
             this.completedReads = completedReads;
@@ -120,6 +147,15 @@ public class SchedulerMetrics {
             this.prefetchHitBytes = prefetchHitBytes;
             this.prefetchWastedBytes = prefetchWastedBytes;
             this.prefetchBackoffs = prefetchBackoffs;
+            this.prefetchInvalidations = prefetchInvalidations;
+            this.prefetchInvalidatedBytes = prefetchInvalidatedBytes;
+            this.prefetchStaleDrops = prefetchStaleDrops;
+            this.capacityWaits = capacityWaits;
+            this.capacityWaitNanos = capacityWaitNanos;
+            this.rejectedGlobalCapacity = rejectedGlobalCapacity;
+            this.rejectedSubmitterCapacity = rejectedSubmitterCapacity;
+            this.rejectedWaitTimeout = rejectedWaitTimeout;
+            this.agedRequests = agedRequests;
         }
     }
 }

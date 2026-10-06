@@ -1,5 +1,6 @@
 package com.github.guoyyit.asyncioschedulerjava;
 
+import com.github.guoyyit.asyncioschedulerjava.config.CapacityExceededPolicy;
 import com.github.guoyyit.asyncioschedulerjava.config.OverQuotaAction;
 import com.github.guoyyit.asyncioschedulerjava.config.SchedulerConfig;
 import com.github.guoyyit.asyncioschedulerjava.io.IoPriority;
@@ -8,6 +9,7 @@ import com.github.guoyyit.asyncioschedulerjava.io.IoRequest;
 import com.github.guoyyit.asyncioschedulerjava.io.IoTicket;
 import com.github.guoyyit.asyncioschedulerjava.io.IoType;
 import com.github.guoyyit.asyncioschedulerjava.io.QueueRejectedException;
+import com.github.guoyyit.asyncioschedulerjava.io.RejectionReason;
 import com.github.guoyyit.asyncioschedulerjava.io.WriteSegment;
 import com.github.guoyyit.asyncioschedulerjava.prefetch.PrefetchManager;
 import com.github.guoyyit.asyncioschedulerjava.prefetch.PrefetchPlan;
@@ -49,6 +51,7 @@ public class AsyncIOScheduler implements AutoCloseable {
     private final Map<Long, CompletableFuture<IoCompletion>> pending = new ConcurrentHashMap<>();
     private final AtomicInteger totalPending = new AtomicInteger();
     private final Map<String, AtomicInteger> perSubmitterPending = new ConcurrentHashMap<>();
+    private final Object capacityLock = new Object();
 
     private DurableBlockStore store;
     private PriorityRequestQueue queue;
@@ -71,6 +74,7 @@ public class AsyncIOScheduler implements AutoCloseable {
         store = new DurableBlockStore(dataFile, journalFile, config.getBlockSize());
         store.open();
         queue = new PriorityRequestQueue(config.getMaxPendingRequests());
+        queue.setAgingListener(() -> metrics.agedRequests++);
         quotaManager = new QuotaManager(config.getDefaultReadQuotaBytesPerSec(),
                 config.getDefaultWriteQuotaBytesPerSec(), config.getOverQuotaAction());
         prefetcher = new PrefetchManager(config, metrics);
@@ -151,6 +155,9 @@ public class AsyncIOScheduler implements AutoCloseable {
             return;
         }
         running = false;
+        synchronized (capacityLock) {
+            capacityLock.notifyAll();
+        }
         queue.close();
         for (Thread worker : workers) {
             worker.interrupt();
@@ -190,34 +197,85 @@ public class AsyncIOScheduler implements AutoCloseable {
 
     private IoTicket accept(String submitter, String streamId, IoPriority priority,
                             IoType type, long offset, int length, ByteBuffer data) {
-        if (!running) {
-            throw new QueueRejectedException("scheduler is not running");
-        }
         if (offset < 0 || length < 0) {
             throw new IllegalArgumentException("offset and length must be non-negative");
         }
         AtomicInteger submitterCounter =
                 perSubmitterPending.computeIfAbsent(submitter, key -> new AtomicInteger());
-        if (totalPending.get() >= config.getMaxPendingRequests()
-                || submitterCounter.get() >= config.getMaxPendingPerSubmitter()) {
-            metrics.rejectedRequests++;
-            throw new QueueRejectedException("pending request limit reached for submitter '"
-                    + submitter + "'");
+        long waitStartNanos = 0L;
+        synchronized (capacityLock) {
+            if (!running) {
+                metrics.rejectedRequests++;
+                throw new QueueRejectedException("scheduler is not running",
+                        RejectionReason.NOT_RUNNING);
+            }
+            long waitDeadlineNanos = System.nanoTime()
+                    + Math.max(0L, config.getCapacityWaitTimeout().toNanos());
+            while (totalPending.get() >= config.getMaxPendingRequests()
+                    || submitterCounter.get() >= config.getMaxPendingPerSubmitter()) {
+                if (config.getCapacityExceededPolicy() == CapacityExceededPolicy.REJECT) {
+                    rejectImmediately(submitter);
+                }
+                long remainingNanos = waitDeadlineNanos - System.nanoTime();
+                if (remainingNanos <= 0L) {
+                    metrics.rejectedRequests++;
+                    metrics.rejectedWaitTimeout++;
+                    throw new QueueRejectedException("timed out after "
+                            + config.getCapacityWaitTimeout().toMillis()
+                            + " ms waiting for pending capacity (submitter '" + submitter + "')",
+                            RejectionReason.WAIT_TIMEOUT);
+                }
+                if (waitStartNanos == 0L) {
+                    waitStartNanos = System.nanoTime();
+                    metrics.capacityWaits++;
+                }
+                try {
+                    capacityLock.wait(remainingNanos / 1_000_000L,
+                            (int) (remainingNanos % 1_000_000L));
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    metrics.rejectedRequests++;
+                    throw new QueueRejectedException(
+                            "interrupted while waiting for pending capacity",
+                            RejectionReason.UNSPECIFIED);
+                }
+                if (!running) {
+                    metrics.rejectedRequests++;
+                    throw new QueueRejectedException("scheduler is not running",
+                            RejectionReason.NOT_RUNNING);
+                }
+            }
+            if (waitStartNanos != 0L) {
+                metrics.capacityWaitNanos += System.nanoTime() - waitStartNanos;
+            }
+            long id = requestIds.incrementAndGet();
+            CompletableFuture<IoCompletion> future = new CompletableFuture<>();
+            pending.put(id, future);
+            totalPending.incrementAndGet();
+            submitterCounter.incrementAndGet();
+            IoRequest request = new IoRequest(id, type, priority, submitter, streamId,
+                    offset, length, data, System.nanoTime());
+            if (type == IoType.READ) {
+                metrics.submittedReads++;
+            } else {
+                metrics.submittedWrites++;
+            }
+            queue.put(request);
+            return new IoTicket(id, future);
         }
-        long id = requestIds.incrementAndGet();
-        CompletableFuture<IoCompletion> future = new CompletableFuture<>();
-        pending.put(id, future);
-        totalPending.incrementAndGet();
-        submitterCounter.incrementAndGet();
-        IoRequest request = new IoRequest(id, type, priority, submitter, streamId,
-                offset, length, data, System.nanoTime());
-        if (type == IoType.READ) {
-            metrics.submittedReads++;
+    }
+
+    private void rejectImmediately(String submitter) {
+        boolean globalFull = totalPending.get() >= config.getMaxPendingRequests();
+        metrics.rejectedRequests++;
+        if (globalFull) {
+            metrics.rejectedGlobalCapacity++;
         } else {
-            metrics.submittedWrites++;
+            metrics.rejectedSubmitterCapacity++;
         }
-        queue.put(request);
-        return new IoTicket(id, future);
+        throw new QueueRejectedException("pending request limit reached for submitter '"
+                + submitter + "' (" + (globalFull ? "global" : "submitter") + " capacity)",
+                globalFull ? RejectionReason.GLOBAL_CAPACITY : RejectionReason.SUBMITTER_CAPACITY);
     }
 
     private void workerLoop() {
@@ -345,6 +403,9 @@ public class AsyncIOScheduler implements AutoCloseable {
         AtomicInteger counter = perSubmitterPending.get(request.submitter());
         if (counter != null) {
             counter.decrementAndGet();
+        }
+        synchronized (capacityLock) {
+            capacityLock.notifyAll();
         }
         if (future != null) {
             future.complete(completion);
