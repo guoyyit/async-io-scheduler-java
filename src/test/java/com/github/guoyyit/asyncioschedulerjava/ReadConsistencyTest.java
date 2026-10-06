@@ -3,7 +3,6 @@ package com.github.guoyyit.asyncioschedulerjava;
 import com.github.guoyyit.asyncioschedulerjava.config.SchedulerConfig;
 import com.github.guoyyit.asyncioschedulerjava.io.IoCompletion;
 import com.github.guoyyit.asyncioschedulerjava.io.IoPriority;
-import com.github.guoyyit.asyncioschedulerjava.io.IoTicket;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -216,9 +215,5 @@ class ReadConsistencyTest {
         byte[] result = new byte[buffer.remaining()];
         buffer.duplicate().get(result);
         return result;
-    }
-
-    private static IoTicket unused(IoTicket ticket) {
-        return ticket;
     }
 }

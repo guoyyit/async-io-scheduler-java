@@ -52,6 +52,20 @@ int  crc32c        // 覆盖 magic 到各段数据的全部字节
 int  commitMarker  // 0x434F4D49
 ```
 
+## 读一致性语义
+
+- **已确认写入立即可读**：写请求的未来完成（确认）之后，任何提交方对该区域的重叠读
+  必然读到写入后的完整内容，不会读到旧值、全零或新旧混合。
+- **读路径顺序**：读请求先检查写缓冲，若与未落盘写重叠则强制 flush（`flush()` 会等待
+  在途批次真正提交落盘，而不仅是移出缓冲），然后才查预取缓存、最后读数据文件。
+- **预取缓存失效**：每个写批次提交落盘时、且在完成其写未来之前，按段使预取缓存中
+  重叠的区间失效（`prefetchInvalidations` / `prefetchInvalidatedBytes` 可观测）。
+  因此预取开启与关闭时，同一组读写序列的可观察结果一致，差异仅限命中率等性能指标。
+- **在途预取防陈旧**：预取读取前采样失效版本号，填充缓存时若版本已变（期间有写提交），
+  该次预取结果被丢弃并计入 `prefetchStaleDrops` 与 `prefetchWastedBytes`，绝不进入缓存。
+- **并发重叠读写**：数据文件的读与写批次应用在同一互斥下串行化，单次读要么完整看到
+  某批次应用前的内容，要么完整看到应用后的内容，不存在撕裂的中间状态。
+
 ## 调度、优先级与公平性
 
 - 每个优先级（`HIGH/NORMAL/LOW`）一个 FIFO 子队列（`scheduling/PriorityRequestQueue`）。
@@ -94,10 +108,22 @@ int  commitMarker  // 0x434F4D49
 ## 并发准入与背压
 
 - 全局待处理上限 `scheduler.max-pending-requests`，单提交方上限
-  `scheduler.max-pending-per-submitter`。两者任一达到上限，新的提交立即抛
-  `QueueRejectedException`（有界排队 / 拒绝策略），不入队、不分配 future。
-- 单个提交方的突发或慢速故障最多占用自己的配额，不会拖垮全局吞吐。
-- `pendingCount()` / `pendingCount(submitter)` 可查询当前积压。
+  `scheduler.max-pending-per-submitter`。排队深度始终有界，请求不会被静默丢弃。
+- 达到上限时的行为由 `scheduler.capacity-exceeded-policy` 决定：
+  - `REJECT`（默认，兼容旧行为）：立即抛 `QueueRejectedException`，不入队、不分配 future。
+  - `WAIT`：提交线程在 `scheduler.capacity-wait-timeout`（默认 5s）内等待容量释放；
+    已有请求完成时等待者被唤醒并正常获得受理凭证；超时后以带
+    `RejectionReason.WAIT_TIMEOUT` 的 `QueueRejectedException` 失败。等待有界，
+    调用线程不会无限期阻塞；`close()` 会唤醒所有等待者并使其以 `NOT_RUNNING` 失败。
+- 拒绝原因可区分：`QueueRejectedException.reason()` 返回
+  `GLOBAL_CAPACITY`（全局上限）/ `SUBMITTER_CAPACITY`（单提交方上限）/
+  `WAIT_TIMEOUT`（等待超时）/ `NOT_RUNNING`（未运行）。
+- 单个提交方的突发或慢速故障最多占用自己的配额，不会拖垮全局吞吐；提交方不消费
+  结果不会占用容量（完成即释放，与是否读取 future 无关）。
+- 关闭时调度器先排空队列中已受理的请求再停止 worker（优雅关闭），所有已受理请求
+  都到达成功/失败/取消之一的唯一终态。
+- `pendingCount()` / `pendingCount(submitter)` 可查询当前积压；等待次数/等待时长与
+  分原因拒绝计数见指标一节。
 
 ## 带宽配额
 
@@ -108,9 +134,14 @@ int  commitMarker  // 0x434F4D49
   `scheduler.default-write-quota-bytes-per-sec`（默认不限速）。
 - 超配额后的动作由 `OverQuotaAction` 决定，可通过
   `scheduler.setOverQuotaAction(...)` 动态调整：
-  - `DELAY`（默认）：阻塞 worker 直到攒够令牌（计入 `quotaDelayedRequests`）；
+  - `DELAY`（默认）：阻塞 worker 直到攒够令牌（计入 `quotaDelayedRequests`）。
+    单请求超过 1 秒配额窗口时，按缺口比例等待后允许透支为负令牌，
+    保证已受理请求必然终止，不会形成无限等待或绕过容量控制的无限重试；
   - `DEGRADE`：立即服务但把该请求降级为 `LOW` 优先级（计入 `degradedRequests`）；
   - `REJECT`：请求以 `QuotaExceededException` 异常完成，不占用磁盘带宽。
+- 配额延迟会拖慢 worker 消费速度，从而把提交方推向有界容量上限：此时按
+  `capacity-exceeded-policy` 拒绝或限时等待，两条路径的计数都纳入指标，
+  配额路径不享有绕过容量控制的特权。
 - `quotas().snapshots()` / `snapshot(submitter, type)` 返回限速值、估算消耗速率、
   可用令牌与累计延迟次数。
 
@@ -140,9 +171,26 @@ int  commitMarker  // 0x434F4D49
 | `overQuotaAction` | DELAY | 超配额动作：DELAY / DEGRADE / REJECT |
 | `defaultReadQuotaBytesPerSec` | 无限 | 提交方读配额默认值（字节/秒） |
 | `defaultWriteQuotaBytesPerSec` | 无限 | 提交方写配额默认值（字节/秒） |
+| `capacityExceededPolicy` | REJECT | 容量耗尽行为：REJECT（立即拒绝，旧行为）/ WAIT（限时等待） |
+| `capacityWaitTimeout` | 5s | WAIT 模式下等待可用容量的上限，超时以 WAIT_TIMEOUT 失败 |
 
-指标通过 `scheduler.metrics().snapshot()` 获取，涵盖提交/完成/失败/拒绝/降级/延迟计数、
-写批次与合并计数、预取发起/命中/浪费/退避计数。
+> 兼容性：既有提交接口（`submitRead`/`submitWrite` 各重载）、`IoTicket` 受理凭证、
+> 既有配置键与默认值均未改变；新增配置项都有明确默认值，默认配置下读一致性与
+> 崩溃一致性成立，旧调用方无需改动。
+
+## 可查询指标
+
+`scheduler.metrics().snapshot()` 返回不可变快照，字段包括：
+
+- 吞吐与结果：`submittedReads/Writes`、`completedReads/Writes`、`failedRequests`。
+- 过载：`rejectedRequests`（总数）、`rejectedGlobalCapacity`、`rejectedSubmitterCapacity`、
+  `rejectedWaitTimeout`（分原因拒绝）、`capacityWaits`、`capacityWaitNanos`
+  （WAIT 模式等待次数与累计等待时长）。
+- 公平性：`agedRequests`（老化提升次数）、`degradedRequests`、`quotaDelayedRequests`。
+- 写合并：`writeBatches`、`writeBatchBytes`、`mergedWrites`。
+- 预取：`prefetchesIssued`、`prefetchBytesIssued`、`prefetchHits`、`prefetchHitBytes`、
+  `prefetchWastedBytes`、`prefetchBackoffs`、`prefetchInvalidations`、
+  `prefetchInvalidatedBytes`、`prefetchStaleDrops`。
 
 ## 测试覆盖
 
@@ -150,8 +198,24 @@ int  commitMarker  // 0x434F4D49
   CRC 损坏批次识别与截断。
 - `AsyncIOSchedulerConcurrencyTest`：重启后已确认写入可读、16 个并发提交方互不阻塞、
   读己之写、全局/单提交方有界队列拒绝、老化防低优先级饿死。
+- `ReadConsistencyTest`：顺序读触发预取后对已确认写入区域的重叠读取（预取缓存
+  失效）、并发重叠读写只出现完整前像/后像、预取开关两种配置下可观察结果一致、
+  预取活跃时重启后已确认写入可读。
+- `CapacityPolicyTest`：WAIT 模式容量释放后接纳与超时原因、REJECT 模式全局/单提交方
+  原因可区分、单提交方突发流量隔离、老化请求最终完成且可观测、配额延迟与容量
+  上限交互（拒绝计数、无失败、无滞留）。
 - `PrefetchManagerTest`：窗口增长、随机访问退避、命中服务、总量预算有界。
 - `WriteCoalescerTest`：相邻合并、重叠后写覆盖、批量上限拆批、linger 上限、
   缓冲区间可见性。
 - `QuotaManagerTest` / `SchedulerQuotaIntegrationTest`：DELAY/DEGRADE/REJECT、
   令牌退还、按提交方与方向隔离、指标计数。
+
+## 本地验证
+
+```bash
+mvn test          # 全部测试（38 个），有界时间内完成，不依赖固定长睡眠
+mvn test -Dtest=ReadConsistencyTest   # 只跑读一致性场景
+mvn test -Dtest=CapacityPolicyTest    # 只跑过载/容量场景
+```
+
+所有测试使用 `@TempDir` 临时目录，future 等待均带超时上限，失败断言直接指明场景。
