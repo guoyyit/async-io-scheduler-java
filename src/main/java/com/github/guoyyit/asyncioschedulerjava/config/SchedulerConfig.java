@@ -34,6 +34,11 @@ public class SchedulerConfig {
     private long defaultReadQuotaBytesPerSec = Long.MAX_VALUE;
     private long defaultWriteQuotaBytesPerSec = Long.MAX_VALUE;
 
+    private CapacityPolicy capacityPolicy = CapacityPolicy.REJECT;
+    private Duration capacityWaitTimeout = Duration.ofSeconds(5);
+    private Duration maxQueueWait = Duration.ofSeconds(60);
+    private int maxDegradeRequeues = 16;
+
     public int getBlockSize() {
         return blockSize;
     }
@@ -208,5 +213,37 @@ public class SchedulerConfig {
 
     public void setDefaultWriteQuotaBytesPerSec(long defaultWriteQuotaBytesPerSec) {
         this.defaultWriteQuotaBytesPerSec = defaultWriteQuotaBytesPerSec;
+    }
+
+    public CapacityPolicy getCapacityPolicy() {
+        return capacityPolicy;
+    }
+
+    public void setCapacityPolicy(CapacityPolicy capacityPolicy) {
+        this.capacityPolicy = capacityPolicy;
+    }
+
+    public Duration getCapacityWaitTimeout() {
+        return capacityWaitTimeout;
+    }
+
+    public void setCapacityWaitTimeout(Duration capacityWaitTimeout) {
+        this.capacityWaitTimeout = capacityWaitTimeout;
+    }
+
+    public Duration getMaxQueueWait() {
+        return maxQueueWait;
+    }
+
+    public void setMaxQueueWait(Duration maxQueueWait) {
+        this.maxQueueWait = maxQueueWait;
+    }
+
+    public int getMaxDegradeRequeues() {
+        return maxDegradeRequeues;
+    }
+
+    public void setMaxDegradeRequeues(int maxDegradeRequeues) {
+        this.maxDegradeRequeues = maxDegradeRequeues;
     }
 }

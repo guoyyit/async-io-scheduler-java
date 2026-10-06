@@ -11,8 +11,17 @@ public class SchedulerMetrics {
     public long completedWrites;
     public long failedRequests;
     public long rejectedRequests;
+    public long rejectedNotRunning;
+    public long rejectedGlobalCapacity;
+    public long rejectedSubmitterCapacity;
+    public long capacityWaits;
+    public long capacityWaitTimeouts;
+    public long totalCapacityWaitNanos;
+    public long queueWaitTimeouts;
     public long degradedRequests;
+    public long degradeRequeuesExhausted;
     public long quotaDelayedRequests;
+    public long totalQuotaDelayNanos;
 
     public long writeBatches;
     public long writeBatchBytes;
@@ -23,6 +32,7 @@ public class SchedulerMetrics {
     public long prefetchHits;
     public long prefetchHitBytes;
     public long prefetchWastedBytes;
+    public long prefetchInvalidatedBytes;
     public long prefetchBackoffs;
 
     public long totalQueueWaitNanos;
@@ -37,7 +47,11 @@ public class SchedulerMetrics {
                 writeBatches, writeBatchBytes, mergedWrites,
                 prefetchesIssued, prefetchBytesIssued,
                 prefetchHits, prefetchHitBytes,
-                prefetchWastedBytes, prefetchBackoffs);
+                prefetchWastedBytes, prefetchBackoffs,
+                rejectedNotRunning, rejectedGlobalCapacity, rejectedSubmitterCapacity,
+                capacityWaits, capacityWaitTimeouts, totalCapacityWaitNanos,
+                queueWaitTimeouts, degradeRequeuesExhausted, totalQuotaDelayNanos,
+                prefetchInvalidatedBytes);
     }
 
     public void reset() {
@@ -47,8 +61,17 @@ public class SchedulerMetrics {
         completedWrites = 0;
         failedRequests = 0;
         rejectedRequests = 0;
+        rejectedNotRunning = 0;
+        rejectedGlobalCapacity = 0;
+        rejectedSubmitterCapacity = 0;
+        capacityWaits = 0;
+        capacityWaitTimeouts = 0;
+        totalCapacityWaitNanos = 0;
+        queueWaitTimeouts = 0;
         degradedRequests = 0;
+        degradeRequeuesExhausted = 0;
         quotaDelayedRequests = 0;
+        totalQuotaDelayNanos = 0;
         writeBatches = 0;
         writeBatchBytes = 0;
         mergedWrites = 0;
@@ -84,7 +107,21 @@ public class SchedulerMetrics {
         public final long prefetchHitBytes;
         public final long prefetchWastedBytes;
         public final long prefetchBackoffs;
+        public final long rejectedNotRunning;
+        public final long rejectedGlobalCapacity;
+        public final long rejectedSubmitterCapacity;
+        public final long capacityWaits;
+        public final long capacityWaitTimeouts;
+        public final long totalCapacityWaitNanos;
+        public final long queueWaitTimeouts;
+        public final long degradeRequeuesExhausted;
+        public final long totalQuotaDelayNanos;
+        public final long prefetchInvalidatedBytes;
 
+        /**
+         * Legacy constructor kept for source compatibility; the overload
+         * metrics are reported as zero.
+         */
         public MetricsSnapshot(long submittedReads, long submittedWrites,
                                long completedReads, long completedWrites,
                                long failedRequests, long rejectedRequests,
@@ -93,6 +130,28 @@ public class SchedulerMetrics {
                                long prefetchesIssued, long prefetchBytesIssued,
                                long prefetchHits, long prefetchHitBytes,
                                long prefetchWastedBytes, long prefetchBackoffs) {
+            this(submittedReads, submittedWrites, completedReads, completedWrites,
+                    failedRequests, rejectedRequests, degradedRequests, quotaDelayedRequests,
+                    writeBatches, writeBatchBytes, mergedWrites,
+                    prefetchesIssued, prefetchBytesIssued, prefetchHits, prefetchHitBytes,
+                    prefetchWastedBytes, prefetchBackoffs,
+                    0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L);
+        }
+
+        public MetricsSnapshot(long submittedReads, long submittedWrites,
+                               long completedReads, long completedWrites,
+                               long failedRequests, long rejectedRequests,
+                               long degradedRequests, long quotaDelayedRequests,
+                               long writeBatches, long writeBatchBytes, long mergedWrites,
+                               long prefetchesIssued, long prefetchBytesIssued,
+                               long prefetchHits, long prefetchHitBytes,
+                               long prefetchWastedBytes, long prefetchBackoffs,
+                               long rejectedNotRunning, long rejectedGlobalCapacity,
+                               long rejectedSubmitterCapacity,
+                               long capacityWaits, long capacityWaitTimeouts,
+                               long totalCapacityWaitNanos,
+                               long queueWaitTimeouts, long degradeRequeuesExhausted,
+                               long totalQuotaDelayNanos, long prefetchInvalidatedBytes) {
             this.submittedReads = submittedReads;
             this.submittedWrites = submittedWrites;
             this.completedReads = completedReads;
@@ -110,6 +169,16 @@ public class SchedulerMetrics {
             this.prefetchHitBytes = prefetchHitBytes;
             this.prefetchWastedBytes = prefetchWastedBytes;
             this.prefetchBackoffs = prefetchBackoffs;
+            this.rejectedNotRunning = rejectedNotRunning;
+            this.rejectedGlobalCapacity = rejectedGlobalCapacity;
+            this.rejectedSubmitterCapacity = rejectedSubmitterCapacity;
+            this.capacityWaits = capacityWaits;
+            this.capacityWaitTimeouts = capacityWaitTimeouts;
+            this.totalCapacityWaitNanos = totalCapacityWaitNanos;
+            this.queueWaitTimeouts = queueWaitTimeouts;
+            this.degradeRequeuesExhausted = degradeRequeuesExhausted;
+            this.totalQuotaDelayNanos = totalQuotaDelayNanos;
+            this.prefetchInvalidatedBytes = prefetchInvalidatedBytes;
         }
     }
 }

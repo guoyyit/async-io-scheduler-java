@@ -16,9 +16,16 @@ public final class IoRequest {
     private final int length;
     private final ByteBuffer data;
     private final long enqueueNanos;
+    private final int degradeCount;
 
     public IoRequest(long id, IoType type, IoPriority priority, String submitter, String streamId,
                      long offset, int length, ByteBuffer data, long enqueueNanos) {
+        this(id, type, priority, submitter, streamId, offset, length, data, enqueueNanos, 0);
+    }
+
+    public IoRequest(long id, IoType type, IoPriority priority, String submitter, String streamId,
+                     long offset, int length, ByteBuffer data, long enqueueNanos,
+                     int degradeCount) {
         this.id = id;
         this.type = type;
         this.priority = priority;
@@ -28,6 +35,7 @@ public final class IoRequest {
         this.length = length;
         this.data = data;
         this.enqueueNanos = enqueueNanos;
+        this.degradeCount = degradeCount;
     }
 
     public long id() {
@@ -64,5 +72,9 @@ public final class IoRequest {
 
     public long enqueueNanos() {
         return enqueueNanos;
+    }
+
+    public int degradeCount() {
+        return degradeCount;
     }
 }

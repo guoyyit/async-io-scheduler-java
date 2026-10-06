@@ -1,5 +1,6 @@
 package com.github.guoyyit.asyncioschedulerjava;
 
+import com.github.guoyyit.asyncioschedulerjava.config.CapacityPolicy;
 import com.github.guoyyit.asyncioschedulerjava.config.OverQuotaAction;
 import com.github.guoyyit.asyncioschedulerjava.config.SchedulerConfig;
 import com.github.guoyyit.asyncioschedulerjava.io.IoPriority;
@@ -8,6 +9,7 @@ import com.github.guoyyit.asyncioschedulerjava.io.IoRequest;
 import com.github.guoyyit.asyncioschedulerjava.io.IoTicket;
 import com.github.guoyyit.asyncioschedulerjava.io.IoType;
 import com.github.guoyyit.asyncioschedulerjava.io.QueueRejectedException;
+import com.github.guoyyit.asyncioschedulerjava.io.QueueWaitTimeoutException;
 import com.github.guoyyit.asyncioschedulerjava.prefetch.PrefetchManager;
 import com.github.guoyyit.asyncioschedulerjava.prefetch.PrefetchPlan;
 import com.github.guoyyit.asyncioschedulerjava.quota.QuotaExceededException;
@@ -48,6 +50,8 @@ public class AsyncIOScheduler implements AutoCloseable {
     private final Map<Long, CompletableFuture<IoCompletion>> pending = new ConcurrentHashMap<>();
     private final AtomicInteger totalPending = new AtomicInteger();
     private final Map<String, AtomicInteger> perSubmitterPending = new ConcurrentHashMap<>();
+    /** Guards capacity check-and-reserve and wakes submitters waiting for capacity. */
+    private final Object capacityLock = new Object();
 
     private DurableBlockStore store;
     private PriorityRequestQueue queue;
@@ -146,6 +150,9 @@ public class AsyncIOScheduler implements AutoCloseable {
         }
         running = false;
         queue.close();
+        synchronized (capacityLock) {
+            capacityLock.notifyAll();
+        }
         for (Thread worker : workers) {
             worker.interrupt();
             try {
@@ -185,24 +192,20 @@ public class AsyncIOScheduler implements AutoCloseable {
     private IoTicket accept(String submitter, String streamId, IoPriority priority,
                             IoType type, long offset, int length, ByteBuffer data) {
         if (!running) {
-            throw new QueueRejectedException("scheduler is not running");
+            metrics.rejectedRequests++;
+            metrics.rejectedNotRunning++;
+            throw new QueueRejectedException("scheduler is not running",
+                    QueueRejectedException.Reason.SCHEDULER_NOT_RUNNING);
         }
         if (offset < 0 || length < 0) {
             throw new IllegalArgumentException("offset and length must be non-negative");
         }
         AtomicInteger submitterCounter =
                 perSubmitterPending.computeIfAbsent(submitter, key -> new AtomicInteger());
-        if (totalPending.get() >= config.getMaxPendingRequests()
-                || submitterCounter.get() >= config.getMaxPendingPerSubmitter()) {
-            metrics.rejectedRequests++;
-            throw new QueueRejectedException("pending request limit reached for submitter '"
-                    + submitter + "'");
-        }
+        reserveCapacity(submitter, submitterCounter);
         long id = requestIds.incrementAndGet();
         CompletableFuture<IoCompletion> future = new CompletableFuture<>();
         pending.put(id, future);
-        totalPending.incrementAndGet();
-        submitterCounter.incrementAndGet();
         IoRequest request = new IoRequest(id, type, priority, submitter, streamId,
                 offset, length, data, System.nanoTime());
         if (type == IoType.READ) {
@@ -210,8 +213,91 @@ public class AsyncIOScheduler implements AutoCloseable {
         } else {
             metrics.submittedWrites++;
         }
-        queue.put(request);
+        try {
+            queue.put(request);
+        } catch (RuntimeException putFailure) {
+            // Never lose the reserved capacity slot if enqueueing fails.
+            pending.remove(id);
+            synchronized (capacityLock) {
+                totalPending.decrementAndGet();
+                submitterCounter.decrementAndGet();
+                capacityLock.notifyAll();
+            }
+            throw putFailure;
+        }
         return new IoTicket(id, future);
+    }
+
+    /**
+     * Atomically checks and reserves one global + per-submitter pending slot.
+     * In {@code REJECT} mode a full capacity fails immediately; in {@code WAIT}
+     * mode the calling thread parks until a slot is released or the configured
+     * wait timeout elapses. Waiters never hold a slot while parked, so the
+     * pending depth stays bounded in both modes.
+     */
+    private void reserveCapacity(String submitter, AtomicInteger submitterCounter) {
+        long waitTimeoutNanos = config.getCapacityWaitTimeout().toNanos();
+        long waitStarted = 0L;
+        synchronized (capacityLock) {
+            while (true) {
+                boolean globalFull = totalPending.get() >= config.getMaxPendingRequests();
+                boolean submitterFull =
+                        submitterCounter.get() >= config.getMaxPendingPerSubmitter();
+                if (!globalFull && !submitterFull) {
+                    totalPending.incrementAndGet();
+                    submitterCounter.incrementAndGet();
+                    if (waitStarted != 0L) {
+                        metrics.capacityWaits++;
+                        metrics.totalCapacityWaitNanos += System.nanoTime() - waitStarted;
+                    }
+                    return;
+                }
+                if (config.getCapacityPolicy() != CapacityPolicy.WAIT || !running) {
+                    metrics.rejectedRequests++;
+                    if (!running) {
+                        metrics.rejectedNotRunning++;
+                        throw new QueueRejectedException("scheduler is not running",
+                                QueueRejectedException.Reason.SCHEDULER_NOT_RUNNING);
+                    }
+                    if (globalFull) {
+                        metrics.rejectedGlobalCapacity++;
+                        throw new QueueRejectedException("global pending request limit ("
+                                + config.getMaxPendingRequests() + ") reached",
+                                QueueRejectedException.Reason.GLOBAL_CAPACITY_EXHAUSTED);
+                    }
+                    metrics.rejectedSubmitterCapacity++;
+                    throw new QueueRejectedException("pending request limit ("
+                            + config.getMaxPendingPerSubmitter() + ") reached for submitter '"
+                            + submitter + "'",
+                            QueueRejectedException.Reason.SUBMITTER_CAPACITY_EXHAUSTED);
+                }
+                long now = System.nanoTime();
+                if (waitStarted == 0L) {
+                    waitStarted = now;
+                }
+                long waited = now - waitStarted;
+                if (waited >= waitTimeoutNanos) {
+                    metrics.rejectedRequests++;
+                    metrics.capacityWaitTimeouts++;
+                    throw new QueueRejectedException("timed out after "
+                            + config.getCapacityWaitTimeout().toMillis()
+                            + " ms waiting for pending-request capacity",
+                            QueueRejectedException.Reason.WAIT_TIMEOUT);
+                }
+                long remainingMillis = Math.max(1L,
+                        (waitTimeoutNanos - waited) / 1_000_000L);
+                try {
+                    capacityLock.wait(remainingMillis);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    metrics.rejectedRequests++;
+                    metrics.capacityWaitTimeouts++;
+                    throw new QueueRejectedException(
+                            "interrupted while waiting for pending-request capacity",
+                            QueueRejectedException.Reason.WAIT_TIMEOUT);
+                }
+            }
+        }
     }
 
     private void workerLoop() {
@@ -237,14 +323,48 @@ public class AsyncIOScheduler implements AutoCloseable {
     }
 
     private void dispatch(IoRequest request) throws Exception {
+        long maxQueueWaitNanos = config.getMaxQueueWait().toNanos();
+        long queueWaitSoFar = System.nanoTime() - request.enqueueNanos();
+        if (maxQueueWaitNanos > 0L && queueWaitSoFar > maxQueueWaitNanos) {
+            metrics.queueWaitTimeouts++;
+            failRequest(request, new QueueWaitTimeoutException("request " + request.id()
+                    + " waited " + (queueWaitSoFar / 1_000_000L)
+                    + " ms in queue, exceeding the configured maximum of "
+                    + config.getMaxQueueWait().toMillis() + " ms"));
+            return;
+        }
+        long quotaWaitStarted = System.nanoTime();
         OverQuotaAction action = quotaManager.reserve(request.submitter(), request.type(),
                 Math.max(1, request.length()));
+        long quotaWaited = System.nanoTime() - quotaWaitStarted;
+        if (quotaWaited > 0L) {
+            metrics.totalQuotaDelayNanos += quotaWaited;
+        }
         if (action == OverQuotaAction.DELAY) {
             metrics.quotaDelayedRequests++;
         } else if (action == OverQuotaAction.DEGRADE) {
             metrics.degradedRequests++;
-            requeueDegraded(request);
-            return;
+            if (request.degradeCount() >= config.getMaxDegradeRequeues()) {
+                // Bounded retry: after the configured number of demotions the
+                // request fails with a clear reason instead of looping forever
+                // around the capacity controls.
+                metrics.degradeRequeuesExhausted++;
+                failRequest(request, new QuotaExceededException(
+                        "quota still exhausted after " + request.degradeCount()
+                                + " degraded requeues for submitter '"
+                                + request.submitter() + "'"));
+                return;
+            }
+            if (request.degradeCount() >= 1) {
+                // Already demoted once and still over quota: stop spinning
+                // around the queue and wait for tokens like DELAY does.
+                long waited = quotaManager.awaitTokens(request.submitter(), request.type(),
+                        Math.max(1, request.length()));
+                metrics.totalQuotaDelayNanos += waited;
+            } else {
+                requeueDegraded(request);
+                return;
+            }
         } else if (action == OverQuotaAction.REJECT) {
             failRequest(request, new QuotaExceededException(
                     "read/write quota exhausted for submitter '" + request.submitter() + "'"));
@@ -262,7 +382,7 @@ public class AsyncIOScheduler implements AutoCloseable {
     private void requeueDegraded(IoRequest request) {
         IoRequest demoted = new IoRequest(request.id(), request.type(), IoPriority.LOW,
                 request.submitter(), request.streamId(), request.offset(), request.length(),
-                request.data(), request.enqueueNanos());
+                request.data(), request.enqueueNanos(), request.degradeCount() + 1);
         queue.put(demoted);
     }
 
@@ -277,29 +397,34 @@ public class AsyncIOScheduler implements AutoCloseable {
                 coalescer.flush();
             }
             ByteBuffer data = store.read(request.offset(), request.length());
+            // Update sequential-access state BEFORE completing the user read:
+            // a submitter that issues its next read only after observing this
+            // completion must see its access pattern tracked in issue order,
+            // independent of which worker ran the read.
+            PrefetchPlan plan = prefetcher.afterUserRead(
+                    request.streamId(), request.offset(), request.length());
             succeedRequest(request, data);
-            maybePrefetch(request);
+            maybePrefetch(request, plan);
         } catch (IOException | RuntimeException error) {
             quotaManager.refund(request.submitter(), IoType.READ, request.length());
             failRequest(request, error);
         }
     }
 
-    private void maybePrefetch(IoRequest userRead) {
-        if (coalescer.pendingCount() > 0 || !queue.isEmpty()) {
+    private void maybePrefetch(IoRequest userRead, PrefetchPlan plan) {
+        if (plan.isEmpty()) {
             return;
         }
-        PrefetchPlan plan = prefetcher.afterUserRead(
-                userRead.streamId(), userRead.offset(), userRead.length());
-        if (plan.isEmpty()) {
+        if (coalescer.pendingCount() > 0 || !queue.isEmpty()) {
             return;
         }
         if (!quotaManager.tryReserve(userRead.submitter(), IoType.READ, plan.length())) {
             return;
         }
+        long generation = prefetcher.generation();
         try {
             ByteBuffer prefetched = store.read(plan.offset(), plan.length());
-            prefetcher.fill(userRead.streamId(), plan.offset(), prefetched);
+            prefetcher.fill(userRead.streamId(), plan.offset(), prefetched, generation);
         } catch (IOException | RuntimeException error) {
             quotaManager.refund(userRead.submitter(), IoType.READ, plan.length());
         }
@@ -307,6 +432,10 @@ public class AsyncIOScheduler implements AutoCloseable {
 
     private void finishWrite(IoRequest request, Throwable error) {
         if (error == null) {
+            // Invalidate any prefetched bytes overlapping this write BEFORE
+            // confirming it: a read that runs after the confirmation must
+            // never observe data older than this write.
+            prefetcher.invalidate(request.offset(), request.length());
             metrics.completedWrites++;
             complete(request, IoCompletion.ok(request.id()));
         } else {
@@ -328,10 +457,14 @@ public class AsyncIOScheduler implements AutoCloseable {
 
     private void complete(IoRequest request, IoCompletion completion) {
         CompletableFuture<IoCompletion> future = pending.remove(request.id());
-        totalPending.decrementAndGet();
-        AtomicInteger counter = perSubmitterPending.get(request.submitter());
-        if (counter != null) {
-            counter.decrementAndGet();
+        synchronized (capacityLock) {
+            totalPending.decrementAndGet();
+            AtomicInteger counter = perSubmitterPending.get(request.submitter());
+            if (counter != null) {
+                counter.decrementAndGet();
+            }
+            // Released capacity: give submitters parked in WAIT mode a chance.
+            capacityLock.notifyAll();
         }
         if (future != null) {
             future.complete(completion);

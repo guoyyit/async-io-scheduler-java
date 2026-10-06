@@ -81,6 +81,18 @@ public class QuotaManager {
     }
 
     /**
+     * Blocks until {@code bytes} tokens are available and reserved, regardless
+     * of the configured over-quota action. Returns the waited nanoseconds.
+     * Used to stop degraded requests from spinning around the queue.
+     */
+    public long awaitTokens(String submitter, IoType type, int bytes)
+            throws InterruptedException {
+        BucketPair pair = pairFor(submitter);
+        TokenBucket bucket = type == IoType.READ ? pair.read : pair.write;
+        return bucket.reserveBlocking(bytes, System.nanoTime());
+    }
+
+    /**
      * Returns tokens to the bucket (e.g. when a request failed before consuming IO).
      */
     public void refund(String submitter, IoType type, int bytes) {

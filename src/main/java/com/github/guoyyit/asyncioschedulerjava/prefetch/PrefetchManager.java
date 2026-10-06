@@ -54,6 +54,12 @@ public class PrefetchManager implements AutoCloseable {
     private final LinkedHashMap<String, List<CachedRange>> cache =
             new LinkedHashMap<>(16, 0.75f, true);
     private int cachedBytes;
+    /**
+     * Bumped on every invalidation. A prefetch fill that was read from the
+     * store before an invalidation must not resurrect stale bytes, so fills
+     * carry the generation they observed before reading.
+     */
+    private long generation;
 
     public PrefetchManager(SchedulerConfig config, SchedulerMetrics metrics) {
         this.config = config;
@@ -150,19 +156,71 @@ public class PrefetchManager implements AutoCloseable {
 
     /**
      * Stores a completed prefetch read in the cache, accounting for waste.
+     * Uses the current generation; kept for callers that fill synchronously.
      */
     public void fill(String streamId, long offset, ByteBuffer data) {
+        fill(streamId, offset, data, generation());
+    }
+
+    /**
+     * Stores a completed prefetch read only if no invalidation happened since
+     * {@code expectedGeneration} was observed. Returns false when the data was
+     * discarded because a concurrent write invalidated the range in between.
+     */
+    public boolean fill(String streamId, long offset, ByteBuffer data, long expectedGeneration) {
         if (data == null || !data.hasRemaining()) {
-            return;
+            return false;
         }
         byte[] bytes = new byte[data.remaining()];
         data.duplicate().get(bytes);
         synchronized (cacheLock) {
+            if (generation != expectedGeneration) {
+                metrics.prefetchWastedBytes += bytes.length;
+                return false;
+            }
             List<CachedRange> ranges = cache.computeIfAbsent(streamId, key -> new ArrayList<>());
             ranges.add(new CachedRange(offset, bytes));
             ranges.sort((a, b) -> Long.compare(a.offset, b.offset));
             cachedBytes += bytes.length;
             evict();
+            return true;
+        }
+    }
+
+    /**
+     * Current invalidation generation. Snapshot it before reading data that
+     * will later be handed to {@link #fill(String, long, ByteBuffer, long)}.
+     */
+    public long generation() {
+        synchronized (cacheLock) {
+            return generation;
+        }
+    }
+
+    /**
+     * Drops every cached range (across all streams, they share one underlying
+     * file) that overlaps {@code [offset, offset + length)}. Must be called
+     * when a write to that range becomes visible, before the write is
+     * confirmed to its submitter, so no later read can observe stale bytes.
+     */
+    public void invalidate(long offset, long length) {
+        if (length <= 0) {
+            return;
+        }
+        long end = offset + length;
+        synchronized (cacheLock) {
+            generation++;
+            for (List<CachedRange> ranges : cache.values()) {
+                for (int i = ranges.size() - 1; i >= 0; i--) {
+                    CachedRange range = ranges.get(i);
+                    if (range.offset() < end && range.end() > offset) {
+                        cachedBytes -= range.data.length;
+                        metrics.prefetchInvalidatedBytes += range.data.length;
+                        ranges.remove(i);
+                    }
+                }
+            }
+            cache.entrySet().removeIf(entry -> entry.getValue().isEmpty());
         }
     }
 
