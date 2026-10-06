@@ -54,6 +54,7 @@ public class PrefetchManager implements AutoCloseable {
     private final LinkedHashMap<String, List<CachedRange>> cache =
             new LinkedHashMap<>(16, 0.75f, true);
     private int cachedBytes;
+    private long invalidationVersion;
 
     public PrefetchManager(SchedulerConfig config, SchedulerMetrics metrics) {
         this.config = config;
@@ -158,11 +159,70 @@ public class PrefetchManager implements AutoCloseable {
         byte[] bytes = new byte[data.remaining()];
         data.duplicate().get(bytes);
         synchronized (cacheLock) {
-            List<CachedRange> ranges = cache.computeIfAbsent(streamId, key -> new ArrayList<>());
-            ranges.add(new CachedRange(offset, bytes));
-            ranges.sort((a, b) -> Long.compare(a.offset, b.offset));
-            cachedBytes += bytes.length;
-            evict();
+            insert(streamId, offset, bytes);
+        }
+    }
+
+    /**
+     * Version-tagged fill: the entry is only cached if no write invalidation
+     * happened since {@code expectedVersion} was observed. A stale prefetch
+     * result is dropped and accounted as wasted, never served to readers.
+     */
+    public void fill(String streamId, long offset, ByteBuffer data, long expectedVersion) {
+        if (data == null || !data.hasRemaining()) {
+            return;
+        }
+        byte[] bytes = new byte[data.remaining()];
+        data.duplicate().get(bytes);
+        synchronized (cacheLock) {
+            if (expectedVersion != invalidationVersion) {
+                metrics.prefetchStaleDrops++;
+                metrics.prefetchWastedBytes += bytes.length;
+                return;
+            }
+            insert(streamId, offset, bytes);
+        }
+    }
+
+    /**
+     * Current invalidation version. Readers sample it before going to disk;
+     * any overlapping write commit bumps it, invalidating in-flight prefetches.
+     */
+    public long invalidationVersion() {
+        synchronized (cacheLock) {
+            return invalidationVersion;
+        }
+    }
+
+    /**
+     * Drops every cached range overlapping {@code [offset, offset+length)}.
+     * Invoked when a write batch covering that range has been committed, so
+     * subsequent reads can never observe pre-write bytes from the cache.
+     */
+    public void invalidate(long offset, long length) {
+        if (length <= 0) {
+            return;
+        }
+        long end = offset + length;
+        synchronized (cacheLock) {
+            invalidationVersion++;
+            metrics.prefetchInvalidations++;
+            Iterator<Map.Entry<String, List<CachedRange>>> streams = cache.entrySet().iterator();
+            while (streams.hasNext()) {
+                Map.Entry<String, List<CachedRange>> entry = streams.next();
+                Iterator<CachedRange> ranges = entry.getValue().iterator();
+                while (ranges.hasNext()) {
+                    CachedRange range = ranges.next();
+                    if (range.offset() < end && range.end() > offset) {
+                        ranges.remove();
+                        cachedBytes -= range.data.length;
+                        metrics.prefetchInvalidatedBytes += range.data.length;
+                    }
+                }
+                if (entry.getValue().isEmpty()) {
+                    streams.remove();
+                }
+            }
         }
     }
 
@@ -188,6 +248,14 @@ public class PrefetchManager implements AutoCloseable {
         synchronized (cacheLock) {
             return cachedBytes;
         }
+    }
+
+    private void insert(String streamId, long offset, byte[] bytes) {
+        List<CachedRange> ranges = cache.computeIfAbsent(streamId, key -> new ArrayList<>());
+        ranges.add(new CachedRange(offset, bytes));
+        ranges.sort((a, b) -> Long.compare(a.offset, b.offset));
+        cachedBytes += bytes.length;
+        evict();
     }
 
     private List<CachedRange> findCovering(List<CachedRange> ranges, long offset, int length) {

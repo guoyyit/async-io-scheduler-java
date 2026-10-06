@@ -24,6 +24,16 @@ public class SchedulerMetrics {
     public long prefetchHitBytes;
     public long prefetchWastedBytes;
     public long prefetchBackoffs;
+    public long prefetchInvalidations;
+    public long prefetchInvalidatedBytes;
+    public long prefetchStaleDrops;
+
+    public long capacityWaits;
+    public long capacityWaitNanos;
+    public long rejectedGlobalCapacity;
+    public long rejectedSubmitterCapacity;
+    public long rejectedWaitTimeout;
+    public long agedRequests;
 
     public long totalQueueWaitNanos;
     public long totalServiceNanos;

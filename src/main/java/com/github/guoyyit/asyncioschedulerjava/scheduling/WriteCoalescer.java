@@ -9,6 +9,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.time.Duration;
 import java.util.function.BiConsumer;
+import java.util.function.Consumer;
 
 /**
  * Collects small writes and flushes them as merged, ordered batches.
@@ -34,8 +35,10 @@ public class WriteCoalescer implements AutoCloseable {
     private final Object bufferLock = new Object();
     private final TreeMapBuffer buffer = new TreeMapBuffer();
     private long firstEnqueueNanos;
+    private int inFlight;
     private IOException flushFailure;
     private boolean closed;
+    private volatile Consumer<List<WriteSegment>> committedBatchListener;
 
     private final Thread flusher;
 
@@ -113,18 +116,32 @@ public class WriteCoalescer implements AutoCloseable {
     }
 
     /**
+     * Registers a listener invoked with the merged segments of every batch
+     * right after it has been committed durably, before any of the batch's
+     * write futures are completed. Used to keep read-side caches consistent.
+     */
+    public void setCommittedBatchListener(Consumer<List<WriteSegment>> listener) {
+        this.committedBatchListener = listener;
+    }
+
+    /**
      * Force-flushes whatever is buffered, merging adjacent/overlapping segments.
+     * Returns only after every batch drained so far has been committed to the
+     * store, so a subsequent read observes the flushed writes.
      */
     public void flush() throws IOException {
         synchronized (bufferLock) {
-            if (buffer.isEmpty()) {
+            if (buffer.isEmpty() && inFlight == 0) {
+                if (flushFailure != null) {
+                    throw flushFailure;
+                }
                 return;
             }
             bufferLock.notifyAll();
         }
         while (true) {
             synchronized (bufferLock) {
-                if (buffer.isEmpty()) {
+                if (buffer.isEmpty() && inFlight == 0) {
                     if (flushFailure != null) {
                         throw flushFailure;
                     }
@@ -179,8 +196,16 @@ public class WriteCoalescer implements AutoCloseable {
                     }
                     drained = buffer.drainAll();
                     firstEnqueueNanos = 0L;
+                    inFlight++;
                 }
-                flushDrained(drained);
+                try {
+                    flushDrained(drained);
+                } finally {
+                    synchronized (bufferLock) {
+                        inFlight--;
+                        bufferLock.notifyAll();
+                    }
+                }
             }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
@@ -223,6 +248,10 @@ public class WriteCoalescer implements AutoCloseable {
             int mergedAway = segments.size() - merged.size();
             if (batchFlushListener != null) {
                 batchFlushListener.accept(journalBytes, mergedAway);
+            }
+            Consumer<List<WriteSegment>> committedListener = committedBatchListener;
+            if (committedListener != null) {
+                committedListener.accept(merged);
             }
             for (BufferedEntry entry : batch) {
                 completionCallback.accept(entry.request, null);

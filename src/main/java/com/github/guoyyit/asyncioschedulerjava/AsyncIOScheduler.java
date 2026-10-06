@@ -8,6 +8,7 @@ import com.github.guoyyit.asyncioschedulerjava.io.IoRequest;
 import com.github.guoyyit.asyncioschedulerjava.io.IoTicket;
 import com.github.guoyyit.asyncioschedulerjava.io.IoType;
 import com.github.guoyyit.asyncioschedulerjava.io.QueueRejectedException;
+import com.github.guoyyit.asyncioschedulerjava.io.WriteSegment;
 import com.github.guoyyit.asyncioschedulerjava.prefetch.PrefetchManager;
 import com.github.guoyyit.asyncioschedulerjava.prefetch.PrefetchPlan;
 import com.github.guoyyit.asyncioschedulerjava.quota.QuotaExceededException;
@@ -80,6 +81,11 @@ public class AsyncIOScheduler implements AutoCloseable {
                     metrics.mergedWrites += mergedAway;
                 },
                 this::finishWrite);
+        coalescer.setCommittedBatchListener(segments -> {
+            for (WriteSegment segment : segments) {
+                prefetcher.invalidate(segment.offset(), segment.length());
+            }
+        });
 
         running = true;
         List<Thread> created = new ArrayList<>();
@@ -267,15 +273,21 @@ public class AsyncIOScheduler implements AutoCloseable {
     }
 
     private void executeRead(IoRequest request) {
+        try {
+            if (!coalescer.overlapping(request.offset(), request.length()).isEmpty()) {
+                coalescer.flush();
+            }
+        } catch (IOException | RuntimeException error) {
+            quotaManager.refund(request.submitter(), IoType.READ, request.length());
+            failRequest(request, error);
+            return;
+        }
         ByteBuffer cached = prefetcher.lookup(request.streamId(), request.offset(), request.length());
         if (cached != null) {
             succeedRequest(request, cached);
             return;
         }
         try {
-            if (!coalescer.overlapping(request.offset(), request.length()).isEmpty()) {
-                coalescer.flush();
-            }
             ByteBuffer data = store.read(request.offset(), request.length());
             succeedRequest(request, data);
             maybePrefetch(request);
@@ -297,9 +309,10 @@ public class AsyncIOScheduler implements AutoCloseable {
         if (!quotaManager.tryReserve(userRead.submitter(), IoType.READ, plan.length())) {
             return;
         }
+        long version = prefetcher.invalidationVersion();
         try {
             ByteBuffer prefetched = store.read(plan.offset(), plan.length());
-            prefetcher.fill(userRead.streamId(), plan.offset(), prefetched);
+            prefetcher.fill(userRead.streamId(), plan.offset(), prefetched, version);
         } catch (IOException | RuntimeException error) {
             quotaManager.refund(userRead.submitter(), IoType.READ, plan.length());
         }
