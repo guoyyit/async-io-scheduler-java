@@ -41,6 +41,7 @@ final class TokenBucket {
 
     synchronized long reserveBlocking(int bytes, long nowNanos) throws InterruptedException {
         long waited = 0L;
+        boolean oversized = bytes > rateBytesPerSec;
         while (true) {
             refill(nowNanos);
             if (tokens >= bytes) {
@@ -56,6 +57,15 @@ final class TokenBucket {
             wait(waitNanos / 1_000_000L, (int) (waitNanos % 1_000_000L));
             waited += waitNanos;
             nowNanos = System.nanoTime();
+            if (oversized) {
+                // Requests larger than one quota window can never see a full
+                // bucket: after waiting the proportional deficit, debit into
+                // negative so the request terminates instead of hanging.
+                refill(nowNanos);
+                tokens -= bytes;
+                delayedCount++;
+                return waited;
+            }
         }
     }
 

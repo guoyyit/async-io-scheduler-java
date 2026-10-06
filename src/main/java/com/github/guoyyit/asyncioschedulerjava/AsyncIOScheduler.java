@@ -279,10 +279,12 @@ public class AsyncIOScheduler implements AutoCloseable {
     }
 
     private void workerLoop() {
-        while (running) {
+        // Keep draining after close() begins so already-accepted requests are
+        // processed (graceful shutdown) instead of being failed wholesale.
+        while (running || !queue.isEmpty()) {
             IoRequest request;
             try {
-                request = queue.poll(Long.MAX_VALUE, java.util.concurrent.TimeUnit.NANOSECONDS,
+                request = queue.poll(100L, java.util.concurrent.TimeUnit.MILLISECONDS,
                         config.getFairnessPolicy(), config.getAgingThreshold().toNanos(),
                         config.getHighWeight(), config.getNormalWeight(), config.getLowWeight());
             } catch (InterruptedException e) {
@@ -347,8 +349,8 @@ public class AsyncIOScheduler implements AutoCloseable {
         }
         try {
             ByteBuffer data = store.read(request.offset(), request.length());
-            succeedRequest(request, data);
             maybePrefetch(request);
+            succeedRequest(request, data);
         } catch (IOException | RuntimeException error) {
             quotaManager.refund(request.submitter(), IoType.READ, request.length());
             failRequest(request, error);
